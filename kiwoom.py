@@ -15,13 +15,18 @@ from PyQt5.QtCore import QObject
 from PyQt5.QtCore import QThread
 from PyQt5.QtCore import QEventLoop
 from PyQt5.QtWidgets import QApplication
-
+import FinanceDataReader as fdr
+from datetime import datetime
+import pickle
 import numpy as np
 import pandas as pd
 
 import util
 
-
+s_year_date = '2019-01-01';
+total_buy_money = 20000000
+maesu_start_time = 90000
+maesu_end_time  = 150000
 # 상수
 종목별매수상한 = 1000000  # 종목별매수상한 백만원
 매수수수료비율 = 0.00015  # 매도시 평단가에 곱해서 사용
@@ -39,6 +44,43 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(fh_log)
 
+class RequestThreadWorker(QObject):
+    def __init__(self):
+        """요청 쓰레드
+        """
+        super().__init__()
+        self.request_queue = deque()  # 요청 큐
+        self.request_thread_lock = Lock()
+
+        # 간혹 요청에 대한 결과가 콜백으로 오지 않음
+        # 마지막 요청을 저장해 뒀다가 일정 시간이 지나도 결과가 안오면 재요청
+        self.retry_timer = None
+
+    def retry(self, request):
+        logger.debug("키움 함수 재시도: %s %s %s" % (request[0].__name__, request[1], request[2]))
+        self.request_queue.appendleft(request)
+
+    def run(self):
+        while True:
+            # 큐에 요청이 있으면 하나 뺌
+            # 없으면 블락상태로 있음
+            try:
+                request = self.request_queue.popleft()
+            except IndexError as e:
+                time.sleep(2)
+                continue
+
+            # 요청 실행
+            logger.debug("키움 함수 실행: %s %s %s" % (request[0].__name__, request[1], request[2]))
+            request[0](hts, *request[1], **request[2])
+
+            # 요청에대한 결과 대기
+            if not self.request_thread_lock.acquire(blocking=True, timeout=5):
+                # 요청 실패
+                time.sleep(2)
+                self.retry(request)  # 실패한 요청 재시도
+
+            time.sleep(2)  # 0.2초 이상 대기 후 마무리
 
 class SyncRequestDecorator:
     """키움 API 비동기 함수 데코레이터
@@ -82,19 +124,24 @@ class Kiwoom(QAxWidget):
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
         self.OnEventConnect.connect(self.kiwoom_OnEventConnect)
         self.OnReceiveTrData.connect(self.kiwoom_OnReceiveTrData)
-        # self.OnReceiveRealData.connect(self.kiwoom_OnReceiveRealData)
-        # self.OnReceiveConditionVer.connect(self.kiwoom_OnReceiveConditionVer)
-        # self.OnReceiveTrCondition.connect(self.kiwoom_OnReceiveTrCondition)
-        # self.OnReceiveRealCondition.connect(self.kiwoom_OnReceiveRealCondition)
-        # self.OnReceiveChejanData.connect(self.kiwoom_OnReceiveChejanData)
-        # self.OnReceiveMsg.connect(self.kiwoom_OnReceiveMsg)
+        self.OnReceiveRealData.connect(self.kiwoom_OnReceiveRealData)
+        self.OnReceiveConditionVer.connect(self.kiwoom_OnReceiveConditionVer)
+        self.OnReceiveTrCondition.connect(self.kiwoom_OnReceiveTrCondition)
+        self.OnReceiveRealCondition.connect(self.kiwoom_OnReceiveRealCondition)
+        self.OnReceiveChejanData.connect(self.kiwoom_OnReceiveChejanData)
+        self.OnReceiveMsg.connect(self.kiwoom_OnReceiveMsg)
 
         # 파라미터
         self.params = {}
+        self.dict_stock = {}
+        self.dict_callback = {}
 
         # 요청 결과
         self.event = None
         self.result = {}
+
+    def run(self):
+        print("== run ==")
 
     # -------------------------------------
     # 로그인 관련함수
@@ -193,7 +240,7 @@ class Kiwoom(QAxWidget):
         :return:
         """
         res = self.kiwoom_SetInputValue("종목코드", strCode)
-        res = self.kiwoom_CommRqData("주식기본정보", "OPT10001", 0, 화면번호)
+        res = self.kiwoom_CommRqData("주식기본정보", "OPT10001", 0, "0101")
         return res
 
     @SyncRequestDecorator.kiwoom_sync_request
@@ -299,7 +346,7 @@ class Kiwoom(QAxWidget):
 
         elif sRQName == "주식기본정보":
             cnt = self.kiwoom_GetRepeatCnt(sTRCode, sRQName)
-            list_item_name = ["종목명", "현재가", "등락율", "거래량"]
+            list_item_name = ["종목명", "현재가", "등락율", "거래량","시가","상한가"]
             종목코드 = self.kiwoom_GetCommData(sTRCode, sRQName, 0, "종목코드")
             종목코드 = 종목코드.strip()
             dict_stock = self.dict_stock.get(종목코드, {})
@@ -634,6 +681,7 @@ class Kiwoom(QAxWidget):
         lRet = self.dynamicCall("SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
                                        [sRQName, sScreenNo, sAccNo, nOrderType, sCode, nQty, nPrice, sHogaGb,
                                         sOrgOrderNo])
+        return lRet
 
     def kiwoom_OnReceiveMsg(self, sScrNo, sRQName, sTrCode, sMsg, **kwargs):
         """주문성공, 실패 메시지
@@ -780,18 +828,108 @@ class Kiwoom(QAxWidget):
         res = self.dynamicCall("GetChejanData(int)", [nFid])
         return res
 
+def _isBuyStockAvailable(buy_stock_code, cur_price, start_price):
+    bBuyStock = False
 
+    # 금일날짜
+    today = datetime.today().strftime("%Y%m%d")
+    today_f = datetime.today().strftime("%Y%m%d")
+    prev_bus_day = util.get_prev_date(1, 2, today)
+    if prev_bus_day == None:
+        print('매수일이 아닙니다.')
+        prev_bus_day = util.get_prev_date(1, 2, str(int(today) - 1))
+        if prev_bus_day == None:
+            prev_bus_day = util.get_prev_date(1, 2, str(int(today) - 2))
+    s_standard_date = prev_bus_day[1]
+    e_standard_date = prev_bus_day[0]
+    # 대상종목의 매수가 산정을 위한 가격데이타 수집
+    df = fdr.DataReader(buy_stock_code, s_year_date)
+    print('### 5%이상상승당일 종가 : ', df['Close'][s_standard_date],'시가갭날 시가 : ', df['Open'][e_standard_date],'시가갭날 종가 : ', df['Close'][e_standard_date])  # 매수전날 시가
+
+    # 매수가능 구간 가격 조회
+    s_buy_close_price_t = df['Close'][s_standard_date]
+    e_buy_open_price_t = df['Open'][e_standard_date]
+    e_buy_close_price_t = df['Close'][e_standard_date]
+    if (e_buy_open_price_t > e_buy_close_price_t):
+        e_buy_price = int(e_buy_close_price_t)
+    else:
+        e_buy_price = int(e_buy_open_price_t)
+
+    if (s_buy_close_price_t > e_buy_price):
+        s_buy_price = int(e_buy_price)
+        e_buy_price = int(s_buy_close_price_t)
+    else:
+        s_buy_price = int(s_buy_close_price_t)
+        e_buy_price = int(e_buy_price)
+
+    if s_buy_price > int(start_price):
+        print("금일 시가가 매수시작가보다 낮아 매수 불가합니다.")
+        return False
+    if(e_buy_price >= int(cur_price) >= s_buy_price):
+        bBuyStock = True
+    else:
+        bBuyStock = False
+    print('### 시가 : ', s_buy_price, ' 종가 : ', e_buy_price, ' 현재가 : ', int(cur_price), ' 시가 : ', start_price, "매수가능여부 :", bBuyStock)  # 매수전날 시가
+    return bBuyStock
+
+def _isTimeAvalable():
+    now_time = int(datetime.now().strftime('%H%M%S'))
+    if (maesu_end_time >= now_time >= maesu_start_time):
+        return True
+    else:
+        print("매수가능한 시간이 아닙니다.",maesu_start_time,"~",maesu_end_time ," : ",now_time)
+        return True
+
+def load_data():
+    try:
+        f = open("./database.db", "rb")
+        data = pickle.load(f)
+        f.close()
+        return data
+    except:
+        pass
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     hts = Kiwoom()
-
+    global_buy_stock_code_list = ['225430','049830']
+    ACCOUNT_NO = '8111294711'
+    result = -1
+    order_type = 1
     # login
     if hts.kiwoom_GetConnectState() == 0:
         logger.debug('로그인 시도')
         res = hts.kiwoom_CommConnect()
         logger.debug('로그인 결과: {}'.format(res))
+        if len(global_buy_stock_code_list) > 0:
+            local_buy_stock_code_list = global_buy_stock_code_list
+        else:
+            local_buy_stock_code_list = load_data()
+        while True:
+            if _isTimeAvalable():
+                for code in local_buy_stock_code_list:
+                    nQty = 1
+                    hts.kiwoom_TR_OPT10001_주식기본정보요청(code)
+                    cur_price = hts.dict_stock[code].get('현재가')
+                    start_price = hts.dict_stock[code].get('시가')
+                    if _isBuyStockAvailable(code, cur_price, start_price):
+                        high_price = int(hts.dict_stock[code].get('상한가'))
+                        nQty = int(total_buy_money / high_price)
+                        print("매수수량 : ",nQty," 매수상한가 : ",high_price)
+                        result = hts.kiwoom_SendOrder("send_order", "0101", ACCOUNT_NO, order_type, code, nQty, high_price, "00", "")
+                        print(code, result)
+                        if result == 0:
+                            print("매수 요청 하였습니다.")
+                            global_buy_stock_code_list.remove(code)
+                        else:
+                            print("매수 요청 실패하였습니다.")
+                    else:
+                        print("매수 불가합니다.")
+            time.sleep(2)
+
+
         if res.get('result') != 0:
-            sys.exit()
+           sys.exit()
+
 
     # something
     pass
