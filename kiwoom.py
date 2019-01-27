@@ -120,6 +120,13 @@ class Kiwoom(QAxWidget):
         """
         super().__init__()
 
+        # 요청 쓰레드
+        self.request_thread_worker = RequestThreadWorker()
+        self.request_thread = QThread()
+        self.request_thread_worker.moveToThread(self.request_thread)
+        self.request_thread.started.connect(self.request_thread_worker.run)
+        self.request_thread.start()
+
         # 키움 시그널 연결
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
         self.OnEventConnect.connect(self.kiwoom_OnEventConnect)
@@ -647,6 +654,7 @@ class Kiwoom(QAxWidget):
     # 주문 관련함수
     # OnReceiveTRData(), OnReceiveMsg(), OnReceiveChejan()
     # -------------------------------------
+    @SyncRequestDecorator.kiwoom_sync_request
     def kiwoom_SendOrder(self, sRQName, sScreenNo, sAccNo, nOrderType, sCode, nQty, nPrice, sHogaGb, sOrgOrderNo,
                          **kwargs):
         """주문
@@ -694,6 +702,7 @@ class Kiwoom(QAxWidget):
         """
         logger.debug("주문/잔고: %s %s %s %s" % (sScrNo, sRQName, sTrCode, sMsg))
 
+    @SyncRequestDecorator.kiwoom_sync_callback
     def kiwoom_OnReceiveChejanData(self, sGubun, nItemCnt, sFIdList, **kwargs):
         """주문접수, 체결, 잔고발생시
         :param sGubun: 체결구분 접수와 체결시 '0'값, 국내주식 잔고전달은 '1'값, 파생잔고 전달은 '4"
@@ -878,7 +887,7 @@ def _isTimeAvalable():
         return True
     else:
         print("매수가능한 시간이 아닙니다.",maesu_start_time,"~",maesu_end_time ," : ",now_time)
-        return True
+        return False
 
 def load_data():
     try:
